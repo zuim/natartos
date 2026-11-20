@@ -38,6 +38,7 @@ See [SECURITY.md](SECURITY.md) for the trust model.
 | `doom` | Doom | app | yes | tested |
 | `stream` | PC Stream | app | yes | tested |
 | `background` | Custom Background | theme | no | tested |
+| `eyepiece` | Eyepiece (PC display + head tracking over USB) | app | no | tested on fw 01.00.1600; requires `overlay` |
 | `audio` | Custom Audio | theme | no | untested |
 | `mute` | Audio Control | tweak | no | untested |
 | `input` | Key Injection | hook | no | experimental |

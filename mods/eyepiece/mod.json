@@ -1,0 +1,20 @@
+{
+  "id": "eyepiece",
+  "name": "Eyepiece",
+  "version": "0.1",
+  "type": "app",
+  "so": "mod_eyepiece.so",
+  "source": "mod.c",
+  "menu": {
+    "label": "Eyepiece",
+    "action": "launch"
+  },
+  "launch": {
+    "binary": "/vendor/natartos/apps/eyepiece/eyepiece_bridge",
+    "args": [
+      "-b"
+    ],
+    "display": true
+  },
+  "notes": "Eyepiece: the goggles as a PC display over USB. Video in (H.264/HEVC over adb-forwarded TCP, hardware-decoded and scanned out directly) + head tracking out (the goggles' MCU attitude stream, read by eyepiece_bridge; no hook). Needs the overlay mod."
+}
