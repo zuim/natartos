@@ -109,6 +109,21 @@ if [ -d "$APPS_DIR" ]; then
     cp -r "$APPS_DIR" "$DIST_DIR/apps"
 fi
 
+# --- eyepiece_bridge (Android NDK, built on the host, not in Docker) ---
+# Skipped with a message when no NDK is found ($ANDROID_NDK_HOME or
+# ~/Android/Sdk/ndk/*); the mod's menu entry then has nothing to launch.
+set +e
+bash "$MODS_DIR/eyepiece/bridge/build.sh" "$DIST_DIR/apps/eyepiece"
+rc=$?
+set -e
+if [ "$rc" = 3 ]; then
+    echo "[skip] eyepiece_bridge (no Android NDK; set ANDROID_NDK_HOME)"
+    rmdir "$DIST_DIR/apps/eyepiece" "$DIST_DIR/apps" 2>/dev/null || true
+elif [ "$rc" != 0 ]; then
+    echo "[natartos] ERROR: eyepiece_bridge build failed" >&2
+    exit "$rc"
+fi
+
 # --- Generate manifest.json (schema 1, toolya contract) ---
 VERSION="${NATARTOS_VERSION:-dev}"
 

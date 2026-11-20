@@ -16,3 +16,6 @@ reviews/
 DESIGN.md
 MANIFEST.md
 TODO.md
+
+# eyepiece_bridge local build output
+mods/eyepiece/bridge/out/
