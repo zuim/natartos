@@ -60,6 +60,17 @@ docker run --rm \
 
   chmod 644 /dist/*.so
 
+  # A preloaded .so with an unresolved symbol makes the dynamic linker abort
+  # every process it is preloaded into (inject.sh's own date/basename too, so
+  # the respawn comes up without mods). -nostdlib can't resolve libgcc helpers
+  # such as gcc's outline atomics (__aarch64_swp8_* from __atomic_exchange_n).
+  bad=0
+  for so in /dist/*.so; do
+    u=\$(aarch64-linux-gnu-nm -D --undefined-only \"\$so\" | awk '{print \$2}' | grep -vxE 'dlsym' || true)
+    if [ -n \"\$u\" ]; then echo \"[natartos] ERROR: \$so has undefined symbols: \$u\"; bad=1; fi
+  done
+  [ \$bad = 0 ] || exit 1
+
   echo '=== Building binaries ==='
   # fb_receiver: static aarch64 binary for PC streaming
   if [ -f /mods/stream/fb_receiver.c ]; then
@@ -96,6 +107,21 @@ fi
 APPS_DIR="$BASE_DIR/assets/apps"
 if [ -d "$APPS_DIR" ]; then
     cp -r "$APPS_DIR" "$DIST_DIR/apps"
+fi
+
+# --- eyepiece_bridge (Android NDK, built on the host, not in Docker) ---
+# Skipped with a message when no NDK is found ($ANDROID_NDK_HOME or
+# ~/Android/Sdk/ndk/*); the mod's menu entry then has nothing to launch.
+set +e
+bash "$MODS_DIR/eyepiece/bridge/build.sh" "$DIST_DIR/apps/eyepiece"
+rc=$?
+set -e
+if [ "$rc" = 3 ]; then
+    echo "[skip] eyepiece_bridge (no Android NDK; set ANDROID_NDK_HOME)"
+    rmdir "$DIST_DIR/apps/eyepiece" "$DIST_DIR/apps" 2>/dev/null || true
+elif [ "$rc" != 0 ]; then
+    echo "[natartos] ERROR: eyepiece_bridge build failed" >&2
+    exit "$rc"
 fi
 
 # --- Generate manifest.json (schema 1, toolya contract) ---
