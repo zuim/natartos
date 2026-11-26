@@ -16,5 +16,5 @@
     ],
     "display": true
   },
-  "notes": "Eyepiece: the goggles as a PC display over USB. Video in (H.264/HEVC over adb-forwarded TCP, hardware-decoded and scanned out directly) + head tracking out (the goggles' MCU attitude stream, read by eyepiece_bridge; no hook). Needs the overlay mod."
+  "notes": "Eyepiece: USB PC video and head tracking. A firmware-specific GUI hook suppresses the backdrop during GUI-visible direct video. Default fullscreen mode needs the overlay mod."
 }

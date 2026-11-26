@@ -44,12 +44,21 @@
             includeNDK = true;
             platformVersions = [ "28" ];
           };
+          schemaPath = builtins.getEnv "EYEPIECE_PROTO";
+          schema =
+            if schemaPath == "" then
+              throw "Set EYEPIECE_PROTO to the canonical eyepiece-rpc.proto and use nix build --impure"
+            else
+              builtins.path {
+                path = builtins.toPath schemaPath;
+                name = "eyepiece-rpc.proto";
+              };
         in
         {
           default =
             pkgs.runCommand "natartos-dist"
               {
-                nativeBuildInputs = buildTools pkgs cross ++ [ android.androidsdk ];
+                nativeBuildInputs = buildTools pkgs cross ++ [ android.androidsdk pkgs.nanopb pkgs.protobuf ];
                 buildInputs = [
                   cross.glibc
                   cross.glibc.static
@@ -57,9 +66,16 @@
                 AARCH64_CC = "${cross.stdenv.cc}/bin/${cross.stdenv.cc.targetPrefix}gcc";
                 AARCH64_NM = "${cross.stdenv.cc.bintools}/bin/${cross.stdenv.cc.targetPrefix}nm";
                 ANDROID_NDK_HOME = "${android.androidsdk}/libexec/android-sdk/ndk-bundle";
+                NANOPB_DIR = "${pkgs.nanopb.src}";
+                EYEPIECE_PROTO_SOURCE = schema;
+                NANOPB_PYTHONPATH = pkgs.python3Packages.makePythonPath [
+                  pkgs.nanopb."python-module" pkgs.python3Packages.protobuf
+                ];
               }
               ''
                 export NATARTOS_DIST_DIR="$out"
+                cp "$EYEPIECE_PROTO_SOURCE" "$TMPDIR/eyepiece-rpc.proto"
+                export EYEPIECE_PROTO="$TMPDIR/eyepiece-rpc.proto"
                 bash ${./.}/scripts/build.sh
               '';
         }
@@ -75,10 +91,14 @@
             platformVersions = [ "28" ];
           };
           defaultShell = pkgs.mkShell {
-            packages = buildTools pkgs cross ++ [ android.androidsdk ];
+            packages = buildTools pkgs cross ++ [ android.androidsdk pkgs.nanopb pkgs.protobuf ];
             AARCH64_CC = "${cross.stdenv.cc}/bin/${cross.stdenv.cc.targetPrefix}gcc";
             AARCH64_NM = "${cross.stdenv.cc.bintools}/bin/${cross.stdenv.cc.targetPrefix}nm";
             ANDROID_NDK_HOME = "${android.androidsdk}/libexec/android-sdk/ndk-bundle";
+            NANOPB_DIR = "${pkgs.nanopb.src}";
+            NANOPB_PYTHONPATH = pkgs.python3Packages.makePythonPath [
+              pkgs.nanopb."python-module" pkgs.python3Packages.protobuf
+            ];
             shellHook = ''
               echo "natartos: Nix AArch64 and Android NDK build ready; run ./scripts/build.sh"
             '';

@@ -237,7 +237,7 @@ static void headtrack_bus_stop(void) {
 }
 
 /* Stand-alone stop (stopper process, eyepiece_bridge -Z): joins as test:7 only.  */
-int headtrack_mcu_stop_only(void) {
+static int headtrack_mcu_stop_only(void) {
     if (bus_init() < 0) return -1;
     return mcu_attitude_cmd(0);
 }
@@ -358,8 +358,26 @@ int headtrack_spawn(pose_cb_t cb) {
     fcntl(g_ctl_w, F_SETFD, FD_CLOEXEC);
     g_child = pid;
     pthread_t t;
-    pthread_create(&t, NULL, reader_thread, (void *)(long)p[0]);
-    pthread_detach(t);
+    int r = pthread_create(&t, NULL, reader_thread, (void *)(long)p[0]);
+    if (r != 0) {
+        vlog("headtrack: reader thread creation failed: %s", strerror(r));
+        close(g_ctl_w);
+        g_ctl_w = -1;
+        close(p[0]);
+        /* No control request has been sent, so the helper cannot have started the MCU. */
+        if (kill(pid, SIGKILL) < 0 && errno != ESRCH)
+            vlog("headtrack: cannot terminate helper: %s", strerror(errno));
+        int status;
+        while (waitpid(pid, &status, 0) < 0) {
+            if (errno == EINTR) continue;
+            vlog("headtrack: cannot reap helper: %s", strerror(errno));
+            break;
+        }
+        g_child = 0;
+        return -1;
+    }
+    r = pthread_detach(t);
+    if (r != 0) vlog("headtrack: reader thread detach failed: %s", strerror(r));
     vlog("headtrack: bus helper pid %d", (int)pid);
     return 0;
 }

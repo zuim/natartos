@@ -11,6 +11,7 @@
 
 #define NTLOG_PREFIX "overlay"
 #include "natartos_common.h"
+#include "gui_alpha.h"
 
 #define sys_write       sys_write_raw
 #define my_strlen       natartos_strlen
@@ -28,6 +29,7 @@
 #define __NR_mmap       222
 #define __NR_ftruncate   46
 #define __NR_pread64     67
+#define __NR_pwrite64    68
 #define __NR_munmap     215
 #define MS_INVALIDATE   2
 #define __NR_msync      227
@@ -63,6 +65,16 @@ static long sys_pread64(int fd, void *buf, long count, long offset) {
     register long x2 __asm__("x2") = count;
     register long x3 __asm__("x3") = offset;
     register long x8 __asm__("x8") = __NR_pread64;
+    __asm__ volatile("svc 0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3), "r"(x8) : "memory");
+    return x0;
+}
+
+static long sys_pwrite64(int fd, const void *buf, long count, long offset) {
+    register long x0 __asm__("x0") = fd;
+    register long x1 __asm__("x1") = (long)buf;
+    register long x2 __asm__("x2") = count;
+    register long x3 __asm__("x3") = offset;
+    register long x8 __asm__("x8") = __NR_pwrite64;
     __asm__ volatile("svc 0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3), "r"(x8) : "memory");
     return x0;
 }
@@ -899,6 +911,8 @@ int duss_hal_display_push_frame(void *display_handle, int plane_id, void *frame_
 #define LOCK_SH 1
 #define LOCK_NB 4
 #define LOCK_UN 8
+#define EWOULDBLOCK 11
+#define O_RDWR 2
 
 /* duss_hal_display_plane_blending_set config (DispEngine::setBlend layout) */
 typedef struct __attribute__((packed)) {
@@ -931,28 +945,103 @@ static int gui_hide_wanted(void) {
     return held;
 }
 
+static int gui_plane_order(int plane) {
+    char buf[4096];
+    int fd = (int)sys_openat(AT_FDCWD, "/proc/display/plane", O_RDONLY, 0);
+    if (fd < 0) return -1;
+    long n = sys_read(fd, buf, sizeof(buf));
+    sys_close(fd);
+    if (n <= 0 || n >= (long)sizeof(buf)) return -1;
+    return gui_alpha_blend_order(buf, (int)n, plane);
+}
+
 static void *gui_hide_thread_fn(void *arg) {
     (void)arg;
     struct timespec_t ts = { 0, 20000000 };
     blending_set_fn bset = 0;
     int hidden = 0;
+    int current_alpha = 255;
+    int last_alpha = 255;
+    int last_order = -1;
     sys_unlinkat(AT_FDCWD, GUI_HIDDEN_PATH, 0);   /* no ack from a previous instance */
     while (1) {
         sys_nanosleep(&ts, 0);
         int want = gui_hide_wanted();
-        if (want == hidden) continue;
+        int fd = (int)sys_openat(AT_FDCWD, GUI_ALPHA_PATH, O_RDWR, 0);
+        gui_alpha_request request = { 0 };
+        int requested = 0;
+        int valid = 0;
+        if (fd >= 0) {
+            long lock = sys_flock(fd, LOCK_SH | LOCK_NB);
+            if (lock == -EWOULDBLOCK) {
+                requested = 1;
+                if (sys_pread64(fd, &request, sizeof(request), 0) == sizeof(request) &&
+                    request.request && request.alpha <= 255) {
+                    valid = 1;
+                    last_alpha = (int)request.alpha;
+                }
+            } else if (lock == 0) {
+                sys_flock(fd, LOCK_UN);
+            } else {
+                NTLOG_INT("gui_alpha: flock failed: ", (int)lock);
+                requested = 1;
+            }
+        } else if (fd != -2) {
+            NTLOG_INT("gui_alpha: open failed: ", fd);
+            requested = 1;
+        }
+        if (!requested) last_alpha = 255;
+        int alpha = gui_alpha_effective(want, requested, (uint32_t)last_alpha);
+        int needs_ack = valid && request.acknowledged != request.request;
+        if (want == hidden && alpha == current_alpha && !needs_ack) {
+            if (fd >= 0) sys_close(fd);
+            continue;
+        }
         int plane = g_gui_plane;
         void *h = g_gui_handle;
-        if (plane < 0 || !h) continue;               /* GUI hasn't pushed a frame yet */
+        if (plane < 0 || !h) { if (fd >= 0) sys_close(fd); continue; }
         if (!bset && g_dlsym)
             bset = (blending_set_fn)g_dlsym(RTLD_DEFAULT, "duss_hal_display_plane_blending_set");
-        if (!bset) { NTLOG("fb_gui_hide: no blending_set"); ts.tv_sec = 1; continue; }
-        /* stock GUI blending (/proc/display/plane): per-pixel alpha, gfx0
-         * order 2, gfx1 order 1, no offset. Hidden: global alpha 0. */
-        gui_blend_t b = { 1, (unsigned char)(want ? 1 : 0), 0, 0, want ? 0u : 255u, 0,
-                          (unsigned char)(plane == 6 ? 1 : 2), {0, 0}, 0, 0, 0 };
-        int r = bset(h, (signed char)plane, &b);
-        if (r != 0) { NTLOG_INT("fb_gui_hide: blending_set failed r=", r); continue; }
+        if (!bset) {
+            NTLOG("fb_gui_hide: no blending_set");
+            if (fd >= 0) sys_close(fd);
+            ts.tv_sec = 1;
+            continue;
+        }
+        int order = gui_plane_order(plane);
+        if (order < 0) order = last_order;
+        if (order < 0 && !requested) order = plane == 6 ? 1 : 2;
+        if (order < 0) {
+            NTLOG("gui_alpha: cannot determine GUI plane order");
+            if (needs_ack) {
+                uint32_t status = 2;
+                if (sys_pwrite64(fd, &status, sizeof(status),
+                                 __builtin_offsetof(gui_alpha_request, status)) != sizeof(status) ||
+                    sys_pwrite64(fd, &request.request, sizeof(request.request),
+                                 __builtin_offsetof(gui_alpha_request, acknowledged)) != sizeof(request.request))
+                    NTLOG("gui_alpha: acknowledgement write failed");
+            }
+            if (fd >= 0) sys_close(fd);
+            continue;
+        }
+        last_order = order;
+        gui_blend_t b = { 1, (unsigned char)(want || alpha != 255), 0, 0, (unsigned int)alpha, 0,
+                          (unsigned char)order, {0, 0}, 0, 0, 0 };
+        int r = 0;
+        if (want != hidden || alpha != current_alpha || needs_ack) r = bset(h, (signed char)plane, &b);
+        if (r != 0) NTLOG_INT("gui_alpha: blending_set failed r=", r);
+        if (needs_ack) {
+            uint32_t status = (r != 0 || want) ? 2 : 0;
+            if (sys_pwrite64(fd, &status, sizeof(status),
+                             __builtin_offsetof(gui_alpha_request, status)) != sizeof(status) ||
+                sys_pwrite64(fd, &request.request, sizeof(request.request),
+                             __builtin_offsetof(gui_alpha_request, acknowledged)) != sizeof(request.request))
+                NTLOG("gui_alpha: acknowledgement write failed");
+        }
+        if (fd >= 0) sys_close(fd);
+        if (r != 0) continue;
+        current_alpha = alpha;
+        if (want == hidden) continue;
         hidden = want;
         if (hidden) {
             int fd = (int)sys_openat(AT_FDCWD, GUI_HIDDEN_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0666);

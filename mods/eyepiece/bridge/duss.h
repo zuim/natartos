@@ -67,7 +67,6 @@ typedef struct {
     int  (*event_create_client)(void *rt, uint16_t host, void *attr1,
                                 void *attr2, void *unused, void **client);
     int  (*event_start_client)(void *client);
-    int  (*event_destroy_client)(void *client);
     int  (*event_send_sync_v2)(void *client, duss_msg_t *msg, uint32_t timeout_us,
                                void *resp, uint32_t *resp_len);
     int  (*event_register_dynamic_command_with_user_data)(void *client, int cmd_set,
@@ -81,7 +80,6 @@ typedef struct {
  * 0x15/0x31 {1,0,0,0,0} → imu:2 starts it, {0,0,0,0,0} stops it; the MCU
  * sends 0x15/0x32 at 100 Hz via dji_media_server to test:3.              */
 #define MSG_MCU_ATTI_SET   DUSS_MSG_ID(0x15, 0x31)
-#define MSG_MCU_ATTI_MSG   DUSS_MSG_ID(0x15, 0x32)
 #define MCU_ATTI_SET_LEN   5
 #define MCU_ATTI_MSG_LEN   26   /* f32 w,x,y,z; u32 t_us; u32 0; u16 rate */
 

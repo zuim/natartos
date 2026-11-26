@@ -29,7 +29,6 @@ static char g_link[128];
 static int g_linked;
 static int g_changed;
 static int g_state_saved;
-static int g_link_slot;
 static int g_function_created;
 static int g_mounted;
 static int g_ep0 = -1;
@@ -83,12 +82,12 @@ static int save_state(int slot) {
     if (!f) return -errno;
     int saved = 0;
     if (fprintf(f, "%s %d\n", g_old_udc, slot) <= 0) saved = errno ? errno : EIO;
+    if (!saved && fflush(f) != 0) saved = errno ? errno : EIO;
     if (!saved && fsync(fileno(f)) < 0) saved = errno;
     if (fclose(f) != 0 && !saved) saved = errno ? errno : EIO;
     if (saved) { unlink(tmp); return -saved; }
     if (rename(tmp, state) < 0) { saved = errno; unlink(tmp); return -saved; }
     g_state_saved = 1;
-    g_link_slot = slot;
     return 0;
 }
 
@@ -96,7 +95,12 @@ int bulk_recover(void) {
     const char *state_path = tmp_path("eyepiece.bulk-state");
     char state[128], old_udc[64], link[128], target[256];
     int slot;
-    if (read_text(state_path, state, sizeof(state)) <= 0) return 0;
+    int nread = read_text(state_path, state, sizeof(state));
+    if (nread < 0) {
+        if (errno == ENOENT) return 0;
+        vlog("bulk: cannot read recovery snapshot %s: %s", state_path, strerror(errno));
+        return -1;
+    }
     if (sscanf(state, "%63s %d", old_udc, &slot) != 2 || !old_udc[0] || slot < 1 || slot > 9) {
         vlog("bulk: invalid recovery snapshot %s; leaving USB unchanged", state_path);
         return -1;
@@ -359,11 +363,6 @@ static int write_endpoint_all(int fd, const unsigned char *buf, size_t size) {
     return off == size ? 0 : -1;
 }
 
-static void pump_failed(void) {
-    atomic_store(&g_stop, 1);
-    if (g_pump_fd >= 0) shutdown(g_pump_fd, SHUT_RDWR);
-}
-
 void bulk_log_diagnostics(void) {
     vlog("bulk: OUT totals: reads=%llu usb_bytes=%llu relayed_bytes=%llu",
          (unsigned long long)atomic_load(&g_rx_usb_reads),
@@ -400,7 +399,7 @@ static void *bulk_to_bridge(void *unused) {
         if (write_socket_all(g_pump_fd, buf, (size_t)n) < 0) break;
         atomic_fetch_add(&g_rx_relayed_bytes, (unsigned long long)n);
     }
-    pump_failed();
+    stop_pumps();
     atomic_store(&g_rx_done, 1);
     return NULL;
 }
@@ -425,7 +424,7 @@ static void *bridge_to_bulk(void *unused) {
             write_logged = 1;
         }
     }
-    pump_failed();
+    stop_pumps();
     atomic_store(&g_tx_done, 1);
     return NULL;
 }
@@ -455,13 +454,17 @@ static int start_client(void) {
     atomic_store(&g_stop, 0);
     atomic_store(&g_rx_done, 0);
     atomic_store(&g_tx_done, 0);
-    if (pthread_create(&g_rx_thread, NULL, bulk_to_bridge, NULL) != 0) {
+    int r = pthread_create(&g_rx_thread, NULL, bulk_to_bridge, NULL);
+    if (r != 0) {
         bulk_client_done();
+        errno = r;
         return -1;
     }
     g_rx_started = 1;
-    if (pthread_create(&g_tx_thread, NULL, bridge_to_bulk, NULL) != 0) {
+    r = pthread_create(&g_tx_thread, NULL, bridge_to_bulk, NULL);
+    if (r != 0) {
         bulk_client_done();
+        errno = r;
         return -1;
     }
     g_tx_started = 1;
