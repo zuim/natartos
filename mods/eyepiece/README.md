@@ -85,7 +85,38 @@ Protocol version 1.
 
 ## Bridge options
 
-```
+Experimental work in progress: `-B` adds a separately named `ffs.eyepiece` vendor
+interface without reusing DJI bulk services. TCP listeners remain available.
+The gadget switch temporarily disconnects USB; normal shutdown attempts to restore
+the previous binding, and startup checks a recovery snapshot in
+`/data/local/tmp/eyepiece.bulk-state`. Endpoint pumps use bounded 64 KiB staging buffers
+and blocking FunctionFS endpoint reads/writes; endpoint files do not implement `.poll`.
+The socketpair uses nonblocking polling. A stop flag, SIGUSR1 wakeups, and thread joins
+bound teardown. The Android bridge builds with NDK r30 for API 28; on Apple Silicon, the
+Nix-provided x86_64 host tools run under Rosetta.
+
+This diagnostic build remains experimental. Descriptor binding was tested alongside
+RNDIS/ADB and ACM/ADB at High-Speed on a Mac. After the blocking endpoint-I/O fix, no-video
+bulk PING/PONG passed at about 0.4 ms RTT; one 118,438-byte OUT stream and sustained tests
+through a host-observed 8.5 Mbps passed without USB errors or dropped frames. Each test
+restored ACM + ADB and cleared the recovery snapshot. A three-frame 1080p test at 1 fps
+and 500 kbps decoded on the VC8000D and pushed a frame to VOP0 plane 4. A 30-second
+1080p/20 Mbps test-pattern soak then ran at about 20 fps on the prior build: 600 frames
+pushed, zero display errors or drops, and 72,922,424 USB bytes relayed across 1,252 OUT
+reads. The bounded-write update (500 ms internal socketpair send deadline, no routine
+per-second rate logs) is now installed. A three-frame visible smoke test passed. A
+10-second 1080p/20 Mbps run then relayed 24,133,160 bytes across 424 OUT reads at about
+20 fps with zero drops; routine rate logs were absent. Cleanup restored ACM + ADB and
+cleared the snapshot. The 30-second soak has not been repeated on this update; forced IN
+backpressure and real desktop capture remain untested. `/vendor` is read-only; `/system`
+was not touched. Do not treat bulk as ready for normal use. A power-cycle returns the
+runtime gadget configuration to stock if USB recovery fails.
+
+Latency A/B measured x264 `ultrafast` about 5 ms lower in steady capture-to-shown p50 than
+`superfast` at 1080p/20 fps and roughly 19.5 Mbps, with zero drops. The preset has not been
+made the default because decoded image quality has not been compared.
+
+```text
 -p PORT      TCP port on 127.0.0.1 (default 42420)
 -A           listen on all interfaces instead of loopback
 -s WxH       output framebuffer size (default 1920x1080)

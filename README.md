@@ -117,12 +117,25 @@ Removes all natartos files from `/vendor` and restores backups.
 
 ## Build
 
-Requires an aarch64 cross-compiler (the CI uses `gcc:13` + `gcc-aarch64-linux-gnu`):
+Build the distributable with Docker:
 
+```sh
+bash scripts/build.sh
 ```
-cd src && make                   # builds natartos_loader.so
-# mods are built by CI (see .github/workflows/ci.yml)
+
+The script writes the loader, mods, helper binaries, and manifest to `dist/`.
+It builds `eyepiece_bridge` on the host if an Android NDK is available via
+`ANDROID_NDK_HOME` or `~/Android/Sdk/ndk/`; otherwise, it skips the bridge.
+
+Alternatively, build with the Nix flake on macOS or Linux:
+
+```sh
+nix build
 ```
+
+The flake accepts Google's Android SDK license and includes the NDK, so the
+result includes `eyepiece_bridge`. For local builds without Docker, run
+`nix develop` followed by `bash scripts/build.sh`.
 
 ## Documentation
 

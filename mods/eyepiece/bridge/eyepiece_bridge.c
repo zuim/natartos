@@ -41,6 +41,7 @@ static int  opt_any_addr = 0, opt_null_dec = 0;
  * decode 2.7 ms); falls back to software decode if it fails to open.     */
 static int  opt_hw = 1, opt_hw_frames = 12, opt_hw_sync = -1;   /* -D, -F, -S */
 static int  opt_rndis = 0;   /* -U rndis: USB network to the PC (eyepiece-pc deploy asks for it) */
+static int  opt_bulk = 0;    /* -B: dedicated FunctionFS bulk interface alongside ADB */
 static int  g_rndis;
 static int  opt_direct = 1;  /* -O VOP mask (VOP0 drives both eyes via DSI2DSI), 0 = fb */
 static hwdec_tune_t opt_hw_tune = { 1, 0, 0, 0, 0 };                 /* -L, -O */
@@ -91,6 +92,7 @@ void vlog(const char *fmt, ...) {
 /* ---- client socket ------------------------------------------------------- */
 static int g_cfd = -1;
 static int g_ls = -1;
+static int g_cfd_bulk;
 static pthread_mutex_t g_tx_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static int write_all(int fd, const void *p, size_t n) {
@@ -101,6 +103,38 @@ static int write_all(int fd, const void *p, size_t n) {
         b += w; n -= (size_t)w;
     }
     return 0;
+}
+
+static int write_bulk_all(int fd, const void *p, size_t n) {
+    const uint8_t *b = p;
+    uint64_t deadline = now_us() + 500000;
+    while (n) {
+        if (g_exit) { errno = ECANCELED; return -1; }
+        ssize_t written = send(fd, b, n, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (written > 0) {
+            b += written;
+            n -= (size_t)written;
+            continue;
+        }
+        if (written < 0 && errno == EINTR) continue;
+        if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return -1;
+
+        uint64_t current_time = now_us();
+        if (current_time >= deadline) { errno = ETIMEDOUT; return -1; }
+        struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+        int timeout_ms = (int)((deadline - current_time + 999) / 1000);
+        int ready;
+        do { ready = poll(&pfd, 1, timeout_ms); }
+        while (ready < 0 && errno == EINTR && !g_exit);
+        if (ready == 0) { errno = ETIMEDOUT; return -1; }
+        if (ready < 0) return -1;
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) { errno = EPIPE; return -1; }
+    }
+    return 0;
+}
+
+static int write_client_all(int fd, const void *p, size_t n) {
+    return g_cfd_bulk ? write_bulk_all(fd, p, n) : write_all(fd, p, n);
 }
 
 static int read_all(int fd, void *p, size_t n) {
@@ -114,11 +148,53 @@ static int read_all(int fd, void *p, size_t n) {
     return 0;
 }
 
+static int read_all_bulk(int fd, void *p, size_t n) {
+    size_t requested = n;
+    uint8_t *b = p;
+    uint64_t deadline = now_us() + 5000000;
+    while (n) {
+        uint64_t now = now_us();
+        if (now >= deadline) {
+            vlog("bulk: protocol read timed out (requested=%zu remaining=%zu)", requested, n);
+            bulk_log_diagnostics();
+            return -1;
+        }
+        int timeout_ms = (int)((deadline - now + 999) / 1000);
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int ready;
+        do { ready = poll(&pfd, 1, timeout_ms); } while (ready < 0 && errno == EINTR && !g_exit);
+        if (ready <= 0) {
+            vlog("bulk: protocol read %s (requested=%zu remaining=%zu)",
+                 ready == 0 ? "timed out" : strerror(errno), requested, n);
+            bulk_log_diagnostics();
+            return -1;
+        }
+        if (!(pfd.revents & POLLIN)) {
+            vlog("bulk: protocol socket closed (revents=0x%x requested=%zu remaining=%zu)",
+                 pfd.revents, requested, n);
+            bulk_log_diagnostics();
+            return -1;
+        }
+        ssize_t r = recv(fd, b, n, 0);
+        if (r < 0 && errno == EINTR && !g_exit) continue;
+        if (r <= 0) {
+            vlog("bulk: protocol socket %s (requested=%zu remaining=%zu)",
+                 r == 0 ? "EOF" : strerror(errno), requested, n);
+            bulk_log_diagnostics();
+            return -1;
+        }
+        b += r;
+        n -= (size_t)r;
+    }
+    return 0;
+}
+
 static void tx(uint8_t type, const void *payload, uint32_t len) {
     pthread_mutex_lock(&g_tx_mu);
     if (g_cfd >= 0) {
         ep_hdr_t h = { 'E', 'P', type, 0, len };
-        if (write_all(g_cfd, &h, sizeof(h)) < 0 || (len && write_all(g_cfd, payload, len) < 0)) {
+        if (write_client_all(g_cfd, &h, sizeof(h)) < 0 ||
+            (len && write_client_all(g_cfd, payload, len) < 0)) {
             shutdown(g_cfd, SHUT_RDWR);   /* reader notices and cleans up */
         }
     }
@@ -490,11 +566,12 @@ static void show_video(void) {
     }
 }
 
-static void serve_client(int fd) {
+static void serve_client(int fd, int usb_bulk) {
     int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    if (!usb_bulk) setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     pthread_mutex_lock(&g_tx_mu);
     g_cfd = fd;
+    g_cfd_bulk = usb_bulk;
     pthread_mutex_unlock(&g_tx_mu);
     pthread_mutex_lock(&g_q_mu);
     g_need_key = 1;
@@ -509,14 +586,18 @@ static void serve_client(int fd) {
     uint64_t frames = 0, bytes = 0, t_stat = now_us();
     while (!g_exit) {
         ep_hdr_t h;
-        if (read_all(fd, &h, sizeof(h)) < 0) break;
+        int read_result = usb_bulk ? read_all_bulk(fd, &h, sizeof(h)) : read_all(fd, &h, sizeof(h));
+        if (read_result < 0) break;
         if (h.magic0 != 'E' || h.magic1 != 'P' || h.len > EP_MAX_PAYLOAD) {
             vlog("protocol error (type 0x%02x len %u) → dropping client", h.type, h.len);
             break;
         }
         uint8_t *p = malloc(h.len ? h.len : 1);
         if (!p) break;
-        if (h.len && read_all(fd, p, h.len) < 0) { free(p); break; }
+        if (h.len) {
+            read_result = usb_bulk ? read_all_bulk(fd, p, h.len) : read_all(fd, p, h.len);
+            if (read_result < 0) { free(p); break; }
+        }
         switch (h.type) {
         case EP_VIDEO: {
             if (h.len <= sizeof(ep_video_t) || !opt_video) { free(p); break; }
@@ -573,8 +654,9 @@ static void serve_client(int fd) {
     }
     pthread_mutex_lock(&g_tx_mu);
     g_cfd = -1;
+    g_cfd_bulk = 0;
     pthread_mutex_unlock(&g_tx_mu);
-    close(fd);
+    if (!usb_bulk) close(fd);
     if (opt_headtrack) headtrack_enable(0);   /* only while a PC asks for it */
     pthread_mutex_lock(&g_q_mu);
     q_clear_locked();
@@ -605,6 +687,7 @@ static void usage(const char *a0) {
         "  -U adb|rndis  USB link to the PC: adb (default) = leave USB as is; rndis = switch USB\n"
         "              once per boot to RNDIS + adb and serve DHCP (lower latency than adb\n"
         "              forward; re-enumerates USB, so not while a WebUSB page holds the device)\n"
+        "  -B          add a dedicated FunctionFS bulk interface alongside the current USB functions\n"
         "  -s WxH      output framebuffer size (default 1920x1080)\n"
         "  -t N        decoder slice threads (default 4)\n"
         "  -c N        colour-convert threads (default 4)\n"
@@ -666,7 +749,7 @@ static int take_over(void) {
 
 int main(int argc, char **argv) {
     int o;
-    while ((o = getopt(argc, argv, "p:As:t:c:fVHb1ND:F:S:L:O:TMQ:l:ZhU:")) != -1) {
+    while ((o = getopt(argc, argv, "p:As:t:c:fVHb1ND:F:S:L:O:TMQ:l:ZhU:B")) != -1) {
         switch (o) {
         case 'p': opt_port = atoi(optarg); break;
         case 'A': opt_any_addr = 1; break;
@@ -698,6 +781,7 @@ int main(int argc, char **argv) {
         case 'l': opt_log = optarg; break;
         case 'Z': opt_mcu_stop = 1; break;   /* only send the MCU attitude stop */
         case 'U': opt_rndis = !strcmp(optarg, "rndis"); break;
+        case 'B': opt_bulk = 1; break;
         default: usage(argv[0]); return 2;
         }
     }
@@ -745,6 +829,10 @@ int main(int argc, char **argv) {
     signal(SIGILL, on_crash);
 
     vlog("eyepiece_bridge v%d starting (port %d, fb %dx%d)", EP_VERSION, opt_port, opt_fb_w, opt_fb_h);
+    if (bulk_recover() < 0) {
+        vlog("bulk: refusing startup because interrupted gadget recovery failed");
+        return 1;
+    }
     if (opt_video && opt_hw_tune.direct_vops) dispout_reset_stale_3d();
 
     if (opt_video && opt_hw_tune.direct_vops) {
@@ -779,6 +867,8 @@ int main(int argc, char **argv) {
     /* before listening: the switch drops adb for a few seconds (the PC waits for
      * "listening on" in the log) */
     if (opt_rndis) g_rndis = rndis_setup() == 0;
+    if (opt_bulk && bulk_setup() < 0)
+        vlog("bulk: unavailable; continuing with TCP transports");
     int ls = g_ls = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
     setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
@@ -793,6 +883,45 @@ int main(int argc, char **argv) {
     }
 
     while (!g_exit) {
+        int bulk_fd = opt_bulk ? bulk_pending_client() : -1;
+        struct pollfd pfds[3];
+        int ls_index = -1, ep0_index = -1, bulk_index = -1;
+        nfds_t nfd = 0;
+        if (ls >= 0) {
+            ls_index = (int)nfd;
+            pfds[nfd++] = (struct pollfd){ .fd = ls, .events = POLLIN };
+        }
+        int ep0 = opt_bulk ? bulk_event_fd() : -1;
+        if (ep0 >= 0) {
+            ep0_index = (int)nfd;
+            pfds[nfd++] = (struct pollfd){ .fd = ep0, .events = POLLIN };
+        }
+        if (bulk_fd >= 0) {
+            bulk_index = (int)nfd;
+            pfds[nfd++] = (struct pollfd){ .fd = bulk_fd, .events = POLLIN };
+        }
+        if (!nfd) break;
+        int ready = poll(pfds, nfd, -1);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            if (!g_exit) vlog("poll: %s", strerror(errno));
+            break;
+        }
+        if (ep0_index >= 0 && (pfds[ep0_index].revents & (POLLIN | POLLERR | POLLHUP))) {
+            bulk_update_events();
+        }
+        if (bulk_index >= 0 &&
+            ((pfds[bulk_index].revents & POLLIN) || bulk_session_selected())) {
+            serve_client(bulk_fd, 1);
+            bulk_client_done();
+            if (opt_once) break;
+            continue;
+        }
+        if (bulk_index >= 0 && (pfds[bulk_index].revents & (POLLERR | POLLHUP | POLLNVAL))) {
+            bulk_client_done();
+        }
+        if (ls_index < 0 || !(pfds[ls_index].revents & POLLIN)) continue;
+
         int fd = accept(ls, NULL, NULL);
         if (fd < 0) {
             if (errno == EINTR) continue;
@@ -810,7 +939,17 @@ int main(int argc, char **argv) {
                 continue;
             }
         }
-        serve_client(fd);
+        if (bulk_fd >= 0 && !bulk_tcp_claim()) {
+            close(fd);
+            if (bulk_session_selected()) {
+                serve_client(bulk_fd, 1);
+                bulk_client_done();
+                if (opt_once) break;
+            }
+            continue;
+        }
+        serve_client(fd, 0);
+        if (bulk_fd >= 0) bulk_tcp_done();
         if (opt_once) break;
     }
 
@@ -818,6 +957,7 @@ int main(int argc, char **argv) {
     g_exit = 1;
     pthread_cond_broadcast(&g_q_cv);
     if (ls >= 0) close(ls);
+    if (opt_bulk) bulk_stop();
     if (opt_headtrack) headtrack_stop();
     dispout_qsync_off();                 /* panel back to fixed refresh */
     dispout_stereo_off();                /* VOP0 back to the 2D timing */

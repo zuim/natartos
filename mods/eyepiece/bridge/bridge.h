@@ -76,6 +76,19 @@ int  hwdec_hal_init(void);
 int rndis_setup(void);
 #define RNDIS_ADDR "192.168.60.2"
 
+/* usb_bulk.c - isolated FunctionFS bulk transport alongside the existing gadget functions */
+int  bulk_recover(void);
+int  bulk_setup(void);
+int  bulk_event_fd(void);
+int  bulk_session_selected(void);
+int  bulk_tcp_claim(void);
+void bulk_tcp_done(void);
+void bulk_update_events(void);
+int  bulk_pending_client(void);
+void bulk_client_done(void);
+void bulk_log_diagnostics(void);
+void bulk_stop(void);
+
 /* headtrack.c — head attitude from the goggles' MCU (100 Hz, no drone).
  * The DJI bus clients run in a forked helper process (isolates DJI's
  * framework init + signal handlers from the HAL used by hwdec).          */

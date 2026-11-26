@@ -10,7 +10,7 @@
 # ~/Android/Sdk/ndk/*. Exits with status 3 when no NDK is found.
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SRCS="eyepiece_bridge.c swdec.c hwdec.c dispout.c yuv2fb.c fbout.c fbtext.c headtrack.c rndis.c"
+SRCS="eyepiece_bridge.c swdec.c hwdec.c dispout.c yuv2fb.c fbout.c fbtext.c headtrack.c rndis.c usb_bulk.c"
 CFLAGS="-O2 -Wall -Wextra -Wno-unused-parameter -std=gnu11"
 
 MODE=ndk
@@ -21,7 +21,8 @@ OUT="$(cd "$OUT" && pwd)"
 cd "$HERE"
 
 if [ "$MODE" = host ]; then
-  gcc $CFLAGS -g -o "$OUT/eyepiece_bridge_host" $SRCS -ldl -lm -lpthread
+  HOST_CC="${HOST_CC:-gcc}"
+  "$HOST_CC" $CFLAGS -g -o "$OUT/eyepiece_bridge_host" $SRCS -ldl -lm -lpthread
   echo "built $OUT/eyepiece_bridge_host"
   exit 0
 fi
@@ -30,7 +31,19 @@ NDK="${ANDROID_NDK_HOME:-}"
 if [ -z "$NDK" ]; then
   NDK=$(ls -d "$HOME"/Android/Sdk/ndk/*/ 2>/dev/null | sort -V | tail -1)
 fi
-CC="${NDK%/}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang"
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64|Darwin-aarch64)
+    NDK_HOST="darwin-arm64"
+    if [ -n "$NDK" ] && [ ! -x "${NDK%/}/toolchains/llvm/prebuilt/$NDK_HOST/bin/aarch64-linux-android28-clang" ]; then
+      NDK_HOST="darwin-x86_64"
+    fi
+    ;;
+  Darwin-x86_64) NDK_HOST="darwin-x86_64" ;;
+  Linux-x86_64) NDK_HOST="linux-x86_64" ;;
+  Linux-aarch64|Linux-arm64) NDK_HOST="linux-aarch64" ;;
+  *) echo "unsupported NDK host: $(uname -s)-$(uname -m)" >&2; exit 3 ;;
+esac
+CC="${NDK%/}/toolchains/llvm/prebuilt/$NDK_HOST/bin/aarch64-linux-android28-clang"
 if [ -z "$NDK" ] || [ ! -x "$CC" ]; then
   echo "Android NDK clang not found (set ANDROID_NDK_HOME)" >&2
   exit 3
