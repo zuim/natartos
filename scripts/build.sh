@@ -9,17 +9,66 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BASE_DIR="$SCRIPT_DIR/.."
 SRC_DIR="$BASE_DIR/src"
 MODS_DIR="$BASE_DIR/mods"
-DIST_DIR="$BASE_DIR/dist"
+DIST_DIR="${NATARTOS_DIST_DIR:-$BASE_DIR/dist}"
 DEPLOY_DIR="$BASE_DIR/deploy"
 
 # Clean dist
 rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR"
 
-CC="aarch64-linux-gnu-gcc"
-CFLAGS="-shared -fPIC -O2 -fno-builtin -nostdlib"
+CC="${AARCH64_CC:-aarch64-linux-gnu-gcc}"
+NM="${AARCH64_NM:-aarch64-linux-gnu-nm}"
+CFLAGS="-shared -fPIC -O2 -fno-builtin -fno-stack-protector -nostdlib"
 
-# Cross-compile in Docker: sources RO, output to /dist
+# Use the Nix cross compiler when supplied; otherwise cross-compile in Docker.
+if [ -n "${AARCH64_CC:-}" ]; then
+    echo '=== Building loader (Nix cross toolchain) ==='
+    "$CC" $CFLAGS -I"$BASE_DIR/include" -Wl,-soname,natartos_loader.so \
+        -o "$DIST_DIR/natartos_loader.so" "$SRC_DIR/natartos_loader.c"
+    echo "[natartos] natartos_loader.so ($(stat -c%s "$DIST_DIR/natartos_loader.so") bytes)"
+
+    echo '=== Building mods ==='
+    for moddir in "$MODS_DIR"/*/; do
+        name=$(basename "$moddir")
+        [ ! -f "$moddir/mod.json" ] && continue
+        if grep -q '"so".*null' "$moddir/mod.json"; then
+            echo "[skip] $name (so=null)"; continue
+        fi
+        so=$(grep '"so"' "$moddir/mod.json" | head -1 | sed 's/.*"so"[^\"]*"\([^\"]*\)".*/\1/')
+        [ -z "$so" ] && so="${name}.so"
+        srcfile=$(grep '"source"' "$moddir/mod.json" 2>/dev/null | head -1 | sed 's/.*"source"[^\"]*"\([^\"]*\)".*/\1/')
+        [ -z "$srcfile" ] && srcfile="mod.c"
+        if [ ! -f "$moddir/$srcfile" ]; then
+            echo "[skip] $name (no $srcfile)"; continue
+        fi
+        if grep -q '"libc".*true' "$moddir/mod.json" 2>/dev/null; then
+            MODFLAGS="-shared -fPIC -O2 -fno-stack-protector -lpthread -lm"
+        else
+            MODFLAGS="$CFLAGS"
+        fi
+        "$CC" $MODFLAGS -I"$BASE_DIR/include" -I"$MODS_DIR" \
+            -Wl,-soname,"$so" -o "$DIST_DIR/$so" "$moddir/$srcfile"
+        echo "[natartos] $so ($(stat -c%s "$DIST_DIR/$so") bytes)"
+    done
+
+    chmod 644 "$DIST_DIR"/*.so
+    bad=0
+    for so in "$DIST_DIR"/*.so; do
+        u=$("$NM" -D --undefined-only "$so" | awk '{print $2}' | grep -vxE 'dlsym' || true)
+        if [ -n "$u" ]; then echo "[natartos] ERROR: $so has undefined symbols: $u"; bad=1; fi
+    done
+    [ "$bad" = 0 ] || exit 1
+
+    if [ -f "$MODS_DIR/stream/fb_receiver.c" ]; then
+        "$CC" -static -O2 -I"$BASE_DIR/include" -o "$DIST_DIR/fb_receiver" \
+            "$MODS_DIR/stream/fb_receiver.c" -lm
+        chmod 755 "$DIST_DIR/fb_receiver"
+        echo "[natartos] fb_receiver ($(stat -c%s "$DIST_DIR/fb_receiver") bytes)"
+    fi
+    "$CC" -static -O2 -o "$DIST_DIR/dm_noverity" "$BASE_DIR/tools/dm_noverity.c"
+    chmod 644 "$DIST_DIR/dm_noverity"
+    echo "[natartos] dm_noverity ($(stat -c%s "$DIST_DIR/dm_noverity") bytes)"
+else
 docker run --rm \
   -v "$SRC_DIR:/src:ro" \
   -v "$MODS_DIR:/mods:ro" \
@@ -60,6 +109,17 @@ docker run --rm \
 
   chmod 644 /dist/*.so
 
+  # A preloaded .so with an unresolved symbol makes the dynamic linker abort
+  # every process it is preloaded into (inject.sh's own date/basename too, so
+  # the respawn comes up without mods). -nostdlib can't resolve libgcc helpers
+  # such as gcc's outline atomics (__aarch64_swp8_* from __atomic_exchange_n).
+  bad=0
+  for so in /dist/*.so; do
+    u=\$(aarch64-linux-gnu-nm -D --undefined-only \"\$so\" | awk '{print \$2}' | grep -vxE 'dlsym' || true)
+    if [ -n \"\$u\" ]; then echo \"[natartos] ERROR: \$so has undefined symbols: \$u\"; bad=1; fi
+  done
+  [ \$bad = 0 ] || exit 1
+
   echo '=== Building binaries ==='
   # fb_receiver: static aarch64 binary for PC streaming
   if [ -f /mods/stream/fb_receiver.c ]; then
@@ -80,6 +140,8 @@ docker run --rm \
   echo \"[natartos] dm_noverity (\$(stat -c%s /dist/dm_noverity) bytes)\"
 "
 
+fi
+
 # Copy deploy scripts to dist
 cp "$DEPLOY_DIR/inject.sh" "$DIST_DIR/"
 
@@ -96,6 +158,21 @@ fi
 APPS_DIR="$BASE_DIR/assets/apps"
 if [ -d "$APPS_DIR" ]; then
     cp -r "$APPS_DIR" "$DIST_DIR/apps"
+fi
+
+# --- eyepiece_bridge (Android NDK, built on the host, not in Docker) ---
+# Skipped with a message when no NDK is found ($ANDROID_NDK_HOME or
+# ~/Android/Sdk/ndk/*); the mod's menu entry then has nothing to launch.
+set +e
+bash "$MODS_DIR/eyepiece/bridge/build.sh" "$DIST_DIR/apps/eyepiece"
+rc=$?
+set -e
+if [ "$rc" = 3 ]; then
+    echo "[skip] eyepiece_bridge (no Android NDK; set ANDROID_NDK_HOME)"
+    rmdir "$DIST_DIR/apps/eyepiece" "$DIST_DIR/apps" 2>/dev/null || true
+elif [ "$rc" != 0 ]; then
+    echo "[natartos] ERROR: eyepiece_bridge build failed" >&2
+    exit "$rc"
 fi
 
 # --- Generate manifest.json (schema 1, toolya contract) ---

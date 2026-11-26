@@ -8,7 +8,103 @@ on:
     branches: [master]
 
 jobs:
+  eyepiece-bridge:
+    # Android (bionic) binary: built with the NDK preinstalled on the
+    # ubuntu-latest runner, outside the gcc container used for the mods.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out matching Eyepiece schema
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.EYEPIECE_SCHEMA_REPOSITORY || 'zuim/eyepiece-pc' }}
+          ref: ${{ vars.EYEPIECE_SCHEMA_REF || 'main' }}
+          path: .eyepiece-pc
+
+      - name: Configure schema input
+        run: |
+          schema="$GITHUB_WORKSPACE/.eyepiece-pc/contract/eyepiece-rpc.proto"
+          test -f "$schema" || { echo "::error::Matching Eyepiece schema not found; configure EYEPIECE_SCHEMA_REF"; exit 1; }
+          echo "EYEPIECE_PROTO=$schema" >> "$GITHUB_ENV"
+
+      - name: Install protobuf dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler python3-venv
+          python3 -m venv "$RUNNER_TEMP/nanopb-venv"
+          "$RUNNER_TEMP/nanopb-venv/bin/pip" install nanopb==0.4.9.1
+          git clone --depth 1 --branch nanopb-0.4.9.1 https://github.com/nanopb/nanopb.git "$RUNNER_TEMP/nanopb"
+          echo "$RUNNER_TEMP/nanopb-venv/bin" >> "$GITHUB_PATH"
+          echo "NANOPB_DIR=$RUNNER_TEMP/nanopb" >> "$GITHUB_ENV"
+
+      - name: Build eyepiece_bridge
+        run: |
+          ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" \
+            bash mods/eyepiece/bridge/build.sh out
+          file out/eyepiece_bridge
+
+      - name: Test bridge protobuf protocol
+        shell: bash
+        run: |
+          set -e
+          src="$GITHUB_WORKSPACE/mods/eyepiece/bridge"
+          out="$RUNNER_TEMP/eyepiece-protocol-tests"
+          mkdir -p "$out"
+          protoc -I "$(dirname "$EYEPIECE_PROTO")" --nanopb_out="-f$src/nanopb.options:$out" "$EYEPIECE_PROTO"
+          for test in overlay_pool dispout_argb dispout_ownership usb_bulk_recovery headtrack_thread; do
+            cc -std=gnu11 -Wall -Wextra -pthread -I "$out" -I "$NANOPB_DIR" "$src/tests/${test}_test.c" -ldl -lm -o "$out/$test-test"
+            "$out/$test-test"
+          done
+          cc -std=gnu11 -Wall -Wextra -pthread -I "$out" -I "$NANOPB_DIR" "$src/tests/packed_alpha_test.c" "$src/yuv2bgra.c" -o "$out/color-test"
+          "$out/color-test"
+          bash "$src/build.sh" host "$out"
+          for option in -E -D -P -a -T -M -Q -U -t -f; do
+            if "$out/eyepiece_bridge_host" "$option" > /dev/null 2>&1; then
+              echo "::error::removed bridge option accepted: $option"
+              exit 1
+            fi
+          done
+          if "$out/eyepiece_bridge_host" -O fb > /dev/null 2>&1; then
+            echo "::error::removed -O fb output accepted"
+            exit 1
+          fi
+          pb=("$out/eyepiece-rpc.pb.c" "$NANOPB_DIR/pb_common.c" "$NANOPB_DIR/pb_encode.c" "$NANOPB_DIR/pb_decode.c")
+          cc -std=gnu11 -I "$out" -I "$NANOPB_DIR" "$src/tests/reconfig_protocol_test.c" "${pb[@]}" -o "$out/reconfig-test"
+          cc -std=gnu11 -I "$out" -I "$NANOPB_DIR" "$src/tests/stream_protocol_test.c" "${pb[@]}" -o "$out/stream-test"
+          cc -std=gnu11 -I "$out" -I "$NANOPB_DIR" "$src/tests/gui_alpha_test.c" \
+            "$src/wire.c" "$src/hwdec.c" "$src/dispout.c" "$src/yuv2bgra.c" \
+            "$src/headtrack.c" "$src/usb_bulk.c" \
+            "${pb[@]}" -ldl -lm -lpthread -o "$out/gui-alpha-test"
+          EYEPIECE_TMP="$out" "$out/gui-alpha-test"
+          for test in reconfig before-configure wrong-codec; do
+            port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+            EYEPIECE_TMP="$out" "$out/eyepiece_bridge_host" -N -H -1 -p "$port" >"$out/bridge.log" 2>&1 &
+            pid=$!
+            trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+            for i in {1..100}; do
+              grep -q 'listening on' "$out/bridge.log" && break
+              kill -0 "$pid"
+              sleep 0.1
+            done
+            grep -q 'listening on' "$out/bridge.log" || { cat "$out/bridge.log"; exit 1; }
+            if [ "$test" = reconfig ]; then
+              "$out/reconfig-test" "$port"
+            else
+              "$out/stream-test" "$port" "$test"
+            fi
+            wait "$pid"
+            trap - EXIT
+          done
+
+      - name: Upload eyepiece_bridge
+        uses: actions/upload-artifact@v4
+        with:
+          name: eyepiece-bridge
+          path: out/eyepiece_bridge
+
   build:
+    needs: eyepiece-bridge
     runs-on: ubuntu-latest
     container:
       image: gcc:13
@@ -49,6 +145,18 @@ jobs:
             echo "[natartos] $so ($(stat -c%s "dist/$so") bytes)"
           done
 
+      - name: Check preloaded libraries for unresolved symbols
+        # An unresolved symbol in a preloaded .so aborts every process it is
+        # preloaded into (see scripts/build.sh).
+        run: |
+          bad=0
+          for so in dist/*.so src/*.so; do
+            [ -f "$so" ] || continue
+            u=$(aarch64-linux-gnu-nm -D --undefined-only "$so" | awk '{print $2}' | grep -vxE 'dlsym' || true)
+            if [ -n "$u" ]; then echo "::error::$so has undefined symbols: $u"; bad=1; fi
+          done
+          exit $bad
+
       - name: Build fb_receiver
         run: aarch64-linux-gnu-gcc -static -O2 -I include -o dist/fb_receiver mods/stream/fb_receiver.c -lm
 
@@ -66,20 +174,27 @@ jobs:
       - name: Build dm_noverity
         run: aarch64-linux-gnu-gcc -static -O2 -o dist/dm_noverity tools/dm_noverity.c
 
+      - name: Download eyepiece_bridge
+        uses: actions/download-artifact@v4
+        with:
+          name: eyepiece-bridge
+          path: dist/
+
       - name: Collect dist
         run: |
           mkdir -p dist
           cp src/natartos_loader.so dist/
           cp deploy/inject.sh dist/
           chmod 644 dist/*.so
-          chmod 755 dist/doom_goggles dist/fb_receiver dist/dm_noverity
+          chmod 755 dist/doom_goggles dist/fb_receiver dist/dm_noverity dist/eyepiece_bridge
           # icons (source assets); app binaries are built this run, not committed
           if [ -d assets/icons ]; then mkdir -p dist/icons && cp assets/icons/*.rgba dist/icons/ 2>/dev/null || true; fi
-          mkdir -p dist/apps/stream dist/apps/doom
+          mkdir -p dist/apps/stream dist/apps/doom dist/apps/eyepiece
           cp dist/fb_receiver dist/apps/stream/
           cp dist/doom_goggles dist/apps/doom/
+          cp -p dist/eyepiece_bridge dist/apps/eyepiece/
           cd dist
-          sha256sum *.so inject.sh dm_noverity fb_receiver doom_goggles > SHA256SUMS
+          sha256sum *.so inject.sh dm_noverity fb_receiver doom_goggles eyepiece_bridge > SHA256SUMS
 
       - name: Generate manifest (schema 1)
         run: |
@@ -198,12 +313,14 @@ jobs:
           # Flat asset names (GitHub asset names can't contain "/"), so the web
           # installer can match each manifest `file` basename exactly. Nested
           # dirs (icons, apps) are uploaded flat; apps binaries dup the top-level
-          # fb_receiver/doom_goggles, so only the top-level copies are uploaded.
+          # fb_receiver/doom_goggles/eyepiece_bridge, so only the top-level
+          # copies are uploaded.
           files: |
             dist/*.so
             dist/inject.sh
             dist/fb_receiver
             dist/doom_goggles
+            dist/eyepiece_bridge
             dist/dm_noverity
             dist/manifest.json
             dist/SHA256SUMS

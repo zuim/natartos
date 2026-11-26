@@ -1,0 +1,20 @@
+{
+  "id": "zuim_eyepiece",
+  "name": "Eyepiece",
+  "version": "0.1",
+  "type": "app",
+  "so": "mod_zuim_eyepiece.so",
+  "source": "mod.c",
+  "menu": {
+    "label": "Eyepiece",
+    "action": "launch"
+  },
+  "launch": {
+    "binary": "/vendor/natartos/apps/eyepiece/eyepiece_bridge",
+    "args": [
+      "-b"
+    ],
+    "display": true
+  },
+  "notes": "Eyepiece: USB PC video and head tracking. A firmware-specific GUI hook suppresses the backdrop during GUI-visible direct video. Default fullscreen mode needs the overlay mod."
+}

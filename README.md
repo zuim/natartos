@@ -38,6 +38,7 @@ See [SECURITY.md](SECURITY.md) for the trust model.
 | `doom` | Doom | app | yes | tested |
 | `stream` | PC Stream | app | yes | tested |
 | `background` | Custom Background | theme | no | tested |
+| `zuim_eyepiece` | Eyepiece (PC display + head tracking over USB); [docs](mods/eyepiece/README.md) | app | no | tested on fw 01.00.1600; requires `overlay` |
 | `audio` | Custom Audio | theme | no | untested |
 | `mute` | Audio Control | tweak | no | untested |
 | `input` | Key Injection | hook | no | experimental |
@@ -71,9 +72,11 @@ To **exit Doom**:
 1. Long-hold **BACK** (≥ 500ms) to open the Doom menu
 2. Navigate to "Quit Game" with the joystick
 3. On the confirm dialog, long-hold **BACK** again (center/5D confirm does not work here)
-4. Doom exits but the display freezes — press **BACK** a couple times or
-   wiggle the joystick **left-right** to refresh the screen. Do **not** press
-   the 5D center — Doom is still selected in the menu and center will relaunch it
+4. Doom exits and the overlay nudges the 5D focus so the hidden GUI repaints;
+   the More menu stays open — press **BACK** to return home. If the screen is
+   still frozen, press **BACK** once or wiggle the joystick **left-right**.
+   Do **not** press the 5D center — Doom is still selected in the menu and
+   center will relaunch it
 
 ## Install
 
@@ -114,12 +117,25 @@ Removes all natartos files from `/vendor` and restores backups.
 
 ## Build
 
-Requires an aarch64 cross-compiler (the CI uses `gcc:13` + `gcc-aarch64-linux-gnu`):
+Build the distributable with Docker:
 
+```sh
+bash scripts/build.sh
 ```
-cd src && make                   # builds natartos_loader.so
-# mods are built by CI (see .github/workflows/ci.yml)
+
+The script writes the loader, mods, helper binaries, and manifest to `dist/`.
+It builds `eyepiece_bridge` on the host if an Android NDK is available via
+`ANDROID_NDK_HOME` or `~/Android/Sdk/ndk/`; otherwise, it skips the bridge.
+
+Alternatively, build with the Nix flake on macOS or Linux:
+
+```sh
+nix build
 ```
+
+The flake accepts Google's Android SDK license and includes the NDK, so the
+result includes `eyepiece_bridge`. For local builds without Docker, run
+`nix develop` followed by `bash scripts/build.sh`.
 
 ## Documentation
 
